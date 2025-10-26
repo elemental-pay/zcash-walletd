@@ -4,20 +4,32 @@ extern crate rocket;
 #[path = "generated/cash.z.wallet.sdk.rpc.rs"]
 pub mod lwd_rpc;
 
-mod network;
 mod account;
 mod db;
+mod monitor;
+mod network;
 mod rpc;
 mod scan;
 mod transaction;
 
-use std::str::FromStr;
 pub use crate::rpc::*;
+use anyhow::{anyhow, Result};
+use figment::providers::{Env, Format, Json};
 use network::Network;
-use sapling_crypto::zip32::ExtendedFullViewingKey;
+use std::path::Path;
+use tonic::transport::Channel;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{
+    fmt::{self, format::FmtSpan},
+    layer::SubscriberExt as _,
+    util::SubscriberInitExt as _,
+    EnvFilter, Layer, Registry,
+};
+
+pub type Hash = [u8; 32];
+pub type Client = CompactTxStreamerClient<Channel>;
 
 use clap::Parser;
-use zcash_protocol::consensus::NetworkConstants as _;
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
@@ -34,17 +46,13 @@ struct Args {
 // pub const LWD_URL: &str = "https://lite.ycash.xyz:9067";
 // pub const NOTIFY_TX_URL: &str = "https://localhost:14142/zcashlikedaemoncallback/tx?cryptoCode=yec&hash=";
 
-use crate::db::Db;
-use anyhow::Context;
-use std::sync::Mutex;
-use zcash_client_backend::encoding::decode_extended_full_viewing_key;
-use crate::scan::monitor_task;
-use rocket::fairing::AdHoc;
+use crate::{
+    db::Db, lwd_rpc::compact_tx_streamer_client::CompactTxStreamerClient, monitor::monitor_task,
+};
 use serde::Deserialize;
+use zcash_client_backend::keys::UnifiedFullViewingKey;
 
-pub struct FVK(pub Mutex<ExtendedFullViewingKey>);
-
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug)]
 pub struct WalletConfig {
     port: u16,
     db_path: String,
@@ -53,60 +61,62 @@ pub struct WalletConfig {
     notify_tx_url: String,
     poll_interval: u16,
     regtest: bool,
+    orchard: bool,
+    vk: String,
+    birth_height: u32,
 }
 
 impl WalletConfig {
     pub fn network(&self) -> Network {
-        let network = if self.regtest {
+        if self.regtest {
             Network::Regtest
-        }
-        else {
+        } else {
             Network::Main
-        };
-        network
+        }
     }
 }
 
 #[rocket::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     dotenv::dotenv().ok();
     env_logger::init();
-    let args: Args = Args::parse();
+    let config_path = dotenv::var("CONFIG_PATH")
+        .ok()
+        .unwrap_or("/data/config.json".to_string());
+    let _ = Registry::default()
+        .with(default_layer())
+        .with(env_layer())
+        .try_init();
     let rocket = rocket::build();
-    let figment = rocket.figment();
-    let mut config: WalletConfig = figment.extract().unwrap();
-    let fvk = dotenv::var("VK")
-        .context("Seed missing from .env file")
-        .unwrap();
+    let mut figment = rocket.figment().clone();
+    figment = figment.merge(Env::raw());
+    info!("figment {figment:?}");
+    let config = Path::new(&config_path);
+    if config.exists() {
+        figment = figment.merge(Json::file(config_path));
+    }
+
+    let config: WalletConfig = figment.extract().unwrap();
+    info!("Config {config:?}");
     let network = config.network();
+    assert!(config.orchard);
 
-    let lwd_url = dotenv::var("LWD_URL").ok();
-    let notify_tx_url = dotenv::var("NOTIFY_TX_URL").ok();
-    let confirmations = dotenv::var("CONFIRMATIONS").ok().map(|c| u32::from_str(&c).unwrap());
-    let fvk = decode_extended_full_viewing_key(network.hrp_sapling_extended_full_viewing_key(), &fvk).expect("Invalid viewing key");
-    if let Some(notify_tx_url) = notify_tx_url {
-        config.notify_tx_url = notify_tx_url;
-    }
-    if let Some(lwd_url) = lwd_url {
-        config.lwd_url = lwd_url;
-    }
-    if let Some(confirmations) = confirmations {
-        config.confirmations = confirmations;
-    }
-    let db = Db::new(network, &config.db_path, &fvk);
-    let fvk = FVK(Mutex::new(fvk.clone()));
-    let db_exists = db.create().unwrap();
+    let ufvk = &config.vk;
+    let birth_height = config.birth_height;
+    let ufvk = UnifiedFullViewingKey::decode(&network, ufvk)
+        .map_err(|_| anyhow!("Invalid Unified Viewing Key"))?;
+    let db = Db::new(network, &config.db_path, &ufvk, &config.notify_tx_url).await?;
+    let db_exists = db.create().await?;
     if !db_exists {
-        db.new_account("")?;
+        db.new_account("").await?;
     }
-    let birth_height =
-        if !db_exists || args.rescan {
-            dotenv::var("BIRTH_HEIGHT").ok().map(|h| u32::from_str(&h).unwrap())
-        }
-    else { None };
+    let mut client = CompactTxStreamerClient::connect(config.lwd_url.clone()).await?;
+    db.fetch_block_hash(&mut client, birth_height).await?;
 
-    monitor_task(birth_height, config.port, config.poll_interval).await;
-    rocket.manage(db).manage(fvk)
+    monitor_task(config.port, config.poll_interval).await;
+    rocket
+        .manage(db)
+        .manage(config)
         .mount(
             "/",
             routes![
@@ -121,8 +131,8 @@ async fn main() -> anyhow::Result<()> {
                 request_scan,
             ],
         )
-        .attach(AdHoc::config::<WalletConfig>())
-        .launch().await?;
+        .launch()
+        .await?;
 
     Ok(())
 }
@@ -134,4 +144,27 @@ fn to_tonic<E: ToString>(e: E) -> tonic::Status {
 
 fn from_tonic<E: ToString>(e: E) -> anyhow::Error {
     anyhow::anyhow!(e.to_string())
+}
+
+type BoxedLayer<S> = Box<dyn Layer<S> + Send + Sync + 'static>;
+
+fn default_layer<S>() -> BoxedLayer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    fmt::layer()
+        .with_ansi(false)
+        .with_span_events(FmtSpan::ACTIVE)
+        .compact()
+        .boxed()
+}
+
+fn env_layer<S>() -> BoxedLayer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    EnvFilter::builder()
+        .with_default_directive(LevelFilter::INFO.into())
+        .from_env_lossy()
+        .boxed()
 }

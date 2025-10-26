@@ -1,6 +1,9 @@
+.DS_Store
 /target
 .idea/
 gen.sh
 rpc.tpl
 .env
 *.db
+node_modules/
+docs/

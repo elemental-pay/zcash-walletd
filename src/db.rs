@@ -1,43 +1,62 @@
 use crate::account::{Account, AccountBalance, SubAccount};
+use crate::lwd_rpc::BlockId;
 use crate::network::Network;
-use rusqlite::{params, Connection, OptionalExtension, Row};
-use sapling_crypto::zip32::ExtendedFullViewingKey;
-use std::sync::{Mutex, MutexGuard};
-use zcash_client_backend::encoding::encode_payment_address;
-use zcash_primitives::consensus::{NetworkConstants as _, NetworkUpgrade, Parameters};
-use zcash_primitives::zip32::DiversifierIndex;
-use crate::scan::DecryptedNote;
+use crate::scan::ScanEvent;
+use crate::transaction::{SubAddress, Transfer};
+use crate::{notify_tx, Client, Hash};
+use anyhow::Result;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
+use sqlx::{Acquire, Row, SqliteConnection, SqlitePool};
+use tonic::Request;
 use std::collections::HashMap;
-use crate::transaction::{Transfer, SubAddress};
+use zcash_keys::address::UnifiedAddress;
+use zcash_keys::encoding::AddressCodec;
+use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
+use zcash_primitives::consensus::{NetworkUpgrade, Parameters};
 
 pub struct Db {
     network: Network,
-    connection: Mutex<Connection>,
-    fvk: ExtendedFullViewingKey,
+    pool: SqlitePool,
+    ufvk: UnifiedFullViewingKey,
+    notify_tx_url: String,
 }
 
 impl Db {
-    pub fn new(network: Network, db_path: &str, fvk: &ExtendedFullViewingKey) -> Self {
-        Db {
+    pub async fn new(
+        network: Network,
+        db_path: &str,
+        ufvk: &UnifiedFullViewingKey,
+        notify_tx_url: &str,
+    ) -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(db_path)
+            .create_if_missing(true);
+        let pool = SqlitePool::connect_with(options).await?;
+        Ok(Db {
             network,
-            connection: Mutex::new(Connection::open(db_path).unwrap()),
-            fvk: fvk.clone(),
-        }
+            pool,
+            ufvk: ufvk.clone(),
+            notify_tx_url: notify_tx_url.to_string(),
+        })
     }
 
-    fn grab_lock(&self) -> MutexGuard<Connection> {
-        self.connection.lock().unwrap()
-    }
-
-    pub fn new_account(&self, name: &str) -> anyhow::Result<Account> {
-        let connection = self.grab_lock();
-        let id_account: Option<u32> =
-            connection.query_row("SELECT MAX(account) FROM addresses", [], |row| row.get(0))?;
+    pub async fn new_account(&self, name: &str) -> Result<Account> {
+        let mut connection = self.pool.acquire().await?;
+        let (id_account,): (Option<u32>,) = sqlx::query_as("SELECT MAX(account) FROM addresses")
+            .fetch_one(&mut *connection)
+            .await?;
         let id_account = id_account.map(|id| id + 1).unwrap_or(0);
-        let (diversifier_index, address) = self.next_diversifier(&connection)?;
+        let (diversifier_index, address) = self.next_diversifier(&mut connection).await?;
+        self.store_receivers(
+            &mut connection,
+            name,
+            id_account,
+            0,
+            diversifier_index,
+            &address,
+        )
+        .await?;
 
-        connection.execute("INSERT INTO addresses(label, account, sub_account, address, diversifier_index) VALUES (?1,?2,?3,?4,?5)",
-                           params![name, id_account, 0, &address, diversifier_index])?;
         let account = Account {
             account_index: id_account,
             address,
@@ -45,139 +64,161 @@ impl Db {
         Ok(account)
     }
 
-    pub fn new_sub_account(&self, id_account: u32, name: &str) -> anyhow::Result<SubAccount> {
-        let connection = self.grab_lock();
-        let id_sub_account: u32 = connection.query_row(
-            "SELECT MAX(sub_account) FROM addresses WHERE account = ?1",
-            params![id_account],
-            |row| row.get(0),
-        )?;
+    pub async fn new_sub_account(&self, id_account: u32, name: &str) -> Result<SubAccount> {
+        let mut connection = self.pool.acquire().await?;
+        let (id_sub_account,): (u32,) =
+            sqlx::query_as("SELECT MAX(sub_account) FROM addresses WHERE account = ?1")
+                .bind(id_account)
+                .fetch_one(&mut *connection)
+                .await?;
         let id_sub_account = id_sub_account + 1;
-        let (diversifier_index, address) = self.next_diversifier(&connection)?;
-        connection.execute("INSERT INTO addresses(label, account, sub_account, address, diversifier_index) VALUES (?1,?2,?3,?4,?5)",
-                           params![name, id_account, id_sub_account, &address, diversifier_index])?;
+        let (diversifier_index, address) = self.next_diversifier(&mut connection).await?;
+        self.store_receivers(
+            &mut connection,
+            name,
+            id_account,
+            id_sub_account,
+            diversifier_index,
+            &address,
+        )
+        .await?;
 
         let sub_account = SubAccount {
             account_index: id_account,
             sub_account_index: id_sub_account,
             address,
         };
-
         Ok(sub_account)
     }
 
-    pub fn get_accounts(&self, height: u32, confirmations: u32) -> anyhow::Result<Vec<AccountBalance>> {
-        let connection = self.grab_lock();
-        let mut s = connection.prepare(
-            "WITH base AS (SELECT account, address FROM addresses WHERE sub_account = 0), \
-            balances AS (SELECT account, SUM(value) AS total from received_notes WHERE spent IS NULL GROUP BY account), \
-            unlocked_balances AS (SELECT account, SUM(value) AS unlocked from received_notes WHERE spent IS NULL AND height <= ?1 GROUP BY account) \
-            SELECT a.account, a.label, b.total, COALESCE(u.unlocked, 0) AS unlocked, base.address as base_address \
-            FROM addresses a JOIN balances b ON a.account = b.account LEFT JOIN unlocked_balances u ON u.account = a.account JOIN base ON base.account = a.account GROUP BY a.account")?;
+    async fn store_receivers(
+        &self,
+        connection: &mut SqliteConnection,
+        name: &str,
+        id_account: u32,
+        id_sub_account: u32,
+        diversifier_index: u64,
+        address: &str,
+    ) -> Result<()> {
+        let r = sqlx::query("INSERT INTO addresses(label, account, sub_account, address, diversifier_index) VALUES (?1,?2,?3,?4,?5)")
+            .bind(name)
+            .bind(id_account)
+            .bind(id_sub_account)
+            .bind(address)
+            .bind(diversifier_index as i64)
+            .execute(&mut *connection)
+            .await?;
+        let id_address = r.last_insert_rowid() as u32;
 
-        let confirmed_height = height - confirmations + 1;
-        let rows = s.query_map([confirmed_height], |row| {
-            let id_account: u32 = row.get(0)?;
-            let label: String = row.get(1)?;
-            let balance: u64 = row.get(2)?;
-            let unlocked: u64 = row.get(3)?;
-            let base_address: String = row.get(4)?;
-            Ok(AccountBalance {
-                account_index: id_account,
-                label,
-                balance,
-                unlocked_balance: unlocked,
-                base_address,
-                tag: "".to_string(),
-            })
-        })?;
-
-        let mut sub_accounts: Vec<AccountBalance> = vec![];
-        for row in rows {
-            let sa = row?;
-            sub_accounts.push(sa);
+        let ua = UnifiedAddress::decode(&self.network, address).unwrap();
+        if let Some(address) = ua.sapling() {
+            sqlx::query(
+                "INSERT INTO receivers(pool, id_address, receiver_address)
+                VALUES (1, ?1, ?2)",
+            )
+            .bind(id_address)
+            .bind(address.encode(&self.network))
+            .execute(&mut *connection)
+            .await?;
         }
+        if let Some(address) = ua.orchard() {
+            let ua = UnifiedAddress::from_receivers(Some(*address), None, None).unwrap();
+            sqlx::query(
+                "INSERT INTO receivers(pool, id_address, receiver_address)
+                VALUES (2, ?1, ?2)",
+            )
+            .bind(id_address)
+            .bind(ua.encode(&self.network))
+            .execute(&mut *connection)
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub async fn get_accounts(
+        &self,
+        height: u32,
+        confirmations: u32,
+    ) -> Result<Vec<AccountBalance>> {
+        let mut connection = self.pool.acquire().await?;
+        let confirmed_height = height - confirmations + 1;
+        let sub_accounts = sqlx::query(
+            "WITH base AS (SELECT account, address FROM addresses WHERE sub_account = 0), \
+                balances AS (SELECT account, SUM(value) AS total from received_notes WHERE spent IS NULL GROUP BY account), \
+                unlocked_balances AS (SELECT account, SUM(value) AS unlocked from received_notes WHERE spent IS NULL AND height <= ?1 GROUP BY account) \
+                SELECT a.account, a.label, b.total, COALESCE(u.unlocked, 0) AS unlocked, base.address as base_address \
+                FROM addresses a JOIN balances b ON a.account = b.account LEFT JOIN unlocked_balances u ON u.account = a.account JOIN base ON base.account = a.account GROUP BY a.account")
+            .bind(confirmed_height)
+            .map(|row: SqliteRow| {
+                let id_account: u32 = row.get(0);
+                let label: String = row.get(1);
+                let balance: u64 = row.get(2);
+                let unlocked: u64 = row.get(3);
+                let base_address: String = row.get(4);
+                AccountBalance {
+                    account_index: id_account,
+                    label,
+                    balance,
+                    unlocked_balance: unlocked,
+                    base_address,
+                    tag: "".to_string(),
+                }
+            })
+            .fetch_all(&mut *connection)
+            .await?;
 
         Ok(sub_accounts)
     }
 
-    pub fn store_note(&self, note: &DecryptedNote, id_tx: u32) -> anyhow::Result<u32> {
-        let connection = self.grab_lock();
-
-        let r = connection.query_row("SELECT account, sub_account FROM addresses WHERE address = ?1", [&note.address],
-        |row| {
-            let account: u32 = row.get(0)?;
-            let sub_account: u32 = row.get(1)?;
-            Ok((account, sub_account))
-        }).optional()?;
-        let (account, sub_account) = match r {
-            Some((a, s)) => (Some(a), Some(s)),
-            None => (None, None)
-        };
-
-        connection.execute(
-            "INSERT INTO received_notes(id_tx, address, position, height, diversifier, value, rcm, nf, memo, account, sub_account) \
-            SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11",
-            params![id_tx, &note.address, note.position, note.height, note.diversifier.to_vec(), note.value, note.rcm.to_vec(), note.nf.to_vec(), note.memo,
-            account, sub_account])?;
-        let id_note = connection.last_insert_rowid();
-        Ok(id_note as u32)
-    }
-
-    pub fn store_tx(&self, txid: &[u8], height: u32, value: i64) -> anyhow::Result<u32> {
-        let connection = self.grab_lock();
-
-        connection.execute("INSERT INTO transactions(txid, height, value) VALUES (?1,?2,?3)", params![txid, height, value])?;
-        let id_tx = connection.last_insert_rowid() as u32;
-        Ok(id_tx)
-    }
-
-    pub fn store_block(&self, height: u32, hash: &[u8]) -> anyhow::Result<()> {
-        let connection = self.grab_lock();
-
-        connection.execute("INSERT INTO blocks(height, hash) VALUES (?1,?2)", params![height, hash])?;
-        Ok(())
-    }
-
-    pub fn get_synced_height(&self) -> anyhow::Result<u32> {
-        let connection = self.grab_lock();
-
-        let height = connection.query_row("SELECT MAX(height) FROM blocks", [], |row| {
-            let h: Option<u32> = row.get(0)?;
-            let height = h.unwrap_or_else(|| u32::from(self.network.activation_height(NetworkUpgrade::Sapling).unwrap()));
-            Ok(height)
-        })?;
+    pub async fn get_synced_height(&self) -> Result<u32> {
+        let mut connection = self.pool.acquire().await?;
+        let height = sqlx::query("SELECT MAX(height) FROM blocks")
+            .map(|row: SqliteRow| {
+                let h: Option<u32> = row.get(0);
+                h.unwrap_or_else(|| {
+                    u32::from(
+                        self.network
+                            .activation_height(NetworkUpgrade::Sapling)
+                            .unwrap(),
+                    )
+                })
+            })
+            .fetch_one(&mut *connection)
+            .await?;
         Ok(height)
     }
 
-    pub fn get_block_hash(&self, height: u32) -> anyhow::Result<Option<[u8; 32]>> {
-        let connection = self.grab_lock();
+    pub async fn get_block_hash(&self, height: u32) -> Result<Option<[u8; 32]>> {
+        let mut connection = self.pool.acquire().await?;
 
-        let hash = connection.query_row("SELECT hash FROM blocks WHERE height = ?1", [height], |row| {
-            let hash_vec: Vec<u8> = row.get(0)?;
-            let mut hash = [0u8; 32];
-            hash.copy_from_slice(&hash_vec);
-            Ok(hash)
-        }).optional()?;
+        let hash = sqlx::query("SELECT hash FROM blocks WHERE height = ?1")
+            .bind(height)
+            .map(|row: SqliteRow| {
+                let hash_vec: Vec<u8> = row.get(0);
+                let mut hash = [0u8; 32];
+                hash.copy_from_slice(&hash_vec);
+                hash
+            })
+            .fetch_optional(&mut *connection)
+            .await?;
         Ok(hash)
     }
 
-    pub fn mark_spent(&self, id_note: u32, id_tx: u32) -> anyhow::Result<()> {
-        let connection = self.grab_lock();
-
-        connection.execute("UPDATE received_notes SET spent = ?1 WHERE id_note = ?2", params![id_tx, id_note])?;
-        Ok(())
-    }
-
-    fn row_to_transfer(row: &Row, latest_height: u32, account_index: u32, confirmations: u32) -> rusqlite::Result<Transfer> {
-        let address: String = row.get(0)?;
-        let value: u64 = row.get(1)?;
-        let sub_account: u32 = row.get(2)?;
-        let mut txid: Vec<u8> = row.get(3)?;
+    fn row_to_transfer(
+        row: SqliteRow,
+        latest_height: u32,
+        account_index: u32,
+        confirmations: u32,
+    ) -> Transfer {
+        let address: String = row.get(0);
+        let value: u64 = row.get(1);
+        let sub_account: u32 = row.get(2);
+        let mut txid: Vec<u8> = row.get(3);
         txid.reverse();
-        let memo: String = row.get(4)?;
-        let height: u32 = row.get(5)?;
-        let t = Transfer {
+        let memo: String = row.get(4);
+        let height: u32 = row.get(5);
+        Transfer {
             address,
             amount: value,
             confirmations: latest_height - height + 1,
@@ -187,122 +228,171 @@ impl Db {
             payment_id: "".to_string(),
             subaddr_index: SubAddress {
                 major: account_index,
-                minor: sub_account
+                minor: sub_account,
             },
             suggested_confirmations_threshold: confirmations,
             timestamp: 0, // TODO: Check if needed
             txid: hex::encode(txid),
             r#type: "in".to_string(),
-            unlock_time: 0
-        };
-        Ok(t)
+            unlock_time: 0,
+        }
     }
 
-    pub fn get_transfers(&self, latest_height: u32, account_index: u32, sub_accounts: &[u32], confirmations: u32) -> anyhow::Result<Vec<Transfer>> {
-        let connection = self.grab_lock();
+    pub async fn get_transfers(
+        &self,
+        latest_height: u32,
+        account_index: u32,
+        sub_accounts: &[u32],
+        confirmations: u32,
+    ) -> Result<Vec<Transfer>> {
+        let mut connection = self.pool.acquire().await?;
 
-        let mut s = connection.prepare("SELECT address, n.value, sub_account, txid, memo, n.height \
-        FROM received_notes n JOIN transactions t ON n.id_tx = t.id_tx WHERE \
-        account = ?1")?;
-        let rows = s.query_map([account_index], |row| Self::row_to_transfer(row, latest_height, account_index, confirmations))?;
-        let mut transfers: Vec<Transfer> = vec![];
-        for row in rows {
-            let row = row?;
-            if sub_accounts.contains(&row.subaddr_index.minor) {
-                transfers.push(row);
-            }
-        }
+        let transfers = sqlx::query(
+            "SELECT address, n.value, sub_account, txid, memo, n.height \
+            FROM received_notes n JOIN transactions t ON n.id_tx = t.id_tx WHERE \
+            account = ?1 ORDER BY n.height",
+        )
+        .bind(account_index)
+        .map(|row| Self::row_to_transfer(row, latest_height, account_index, confirmations))
+        .fetch_all(&mut *connection)
+        .await?;
+
+        let transfers = transfers
+            .into_iter()
+            .filter(|transfer| sub_accounts.contains(&transfer.subaddr_index.minor))
+            .collect::<Vec<_>>();
         Ok(transfers)
     }
 
-    pub fn get_transfers_by_txid(&self, latest_height: u32, txid: &str, account_index: u32, confirmations: u32) -> anyhow::Result<Vec<Transfer>> {
-        let connection = self.grab_lock();
+    pub async fn get_transfers_by_txid(
+        &self,
+        latest_height: u32,
+        txid: &str,
+        account_index: u32,
+        confirmations: u32,
+    ) -> Result<Vec<Transfer>> {
+        let mut connection = self.pool.acquire().await?;
 
         let mut txid = hex::decode(txid)?;
         txid.reverse();
-        let mut s = connection.prepare("SELECT address, n.value, sub_account, txid, memo, n.height \
-        FROM received_notes n JOIN transactions t ON n.id_tx = t.id_tx WHERE \
-        txid = ?1")?;
-        let rows = s.query_map(params![&txid], |row| Self::row_to_transfer(row, latest_height, account_index, confirmations))?;
-        let mut transfers: Vec<Transfer> = vec![];
-        for row in rows {
-            let row = row?;
-            transfers.push(row);
-        }
+        let transfers = sqlx::query(
+            "SELECT a.address, n.value, n.sub_account, txid, memo, n.height
+            FROM received_notes n
+			JOIN transactions t ON n.id_tx = t.id_tx
+			JOIN receivers r ON n.address = r.receiver_address
+			JOIN addresses a ON a.id_address = r.id_address
+            WHERE txid = ?1
+			ORDER BY n.height",
+        )
+        .bind(txid)
+        .map(|row| Self::row_to_transfer(row, latest_height, account_index, confirmations))
+        .fetch_all(&mut *connection)
+        .await?;
         Ok(transfers)
     }
 
-    pub fn truncate_height(&self, height: u32) -> anyhow::Result<()> {
-        let connection = self.grab_lock();
+    pub async fn truncate_height(&self, height: u32) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
 
-        connection.execute("DELETE FROM transactions WHERE height >= ?1", [height])?;
-        connection.execute("DELETE FROM received_notes WHERE height >= ?1", [height])?;
-        connection.execute("DELETE FROM blocks WHERE height >= ?1", [height])?;
-        connection.execute("UPDATE received_notes SET spent = NULL WHERE spent >= ?1", [height])?;
+        sqlx::query("DELETE FROM transactions WHERE height >= ?1")
+            .bind(height)
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("DELETE FROM received_notes WHERE height >= ?1")
+            .bind(height)
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("DELETE FROM blocks WHERE height >= ?1")
+            .bind(height)
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query("UPDATE received_notes SET spent = NULL WHERE spent >= ?1")
+            .bind(height)
+            .execute(&mut *connection)
+            .await?;
 
         Ok(())
     }
 
-    pub fn get_nfs(&self) -> anyhow::Result<HashMap<[u8; 32], u32>> {
-        let connection = self.grab_lock();
+    pub async fn fetch_block_hash(
+        &self,
+        client: &mut Client,
+        height: u32,
+    ) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        if sqlx::query("SELECT 1 FROM blocks WHERE height = ?1")
+            .bind(height)
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_none()
+        {
+            let b = client
+                .get_block(Request::new(BlockId {
+                    height: height as u64,
+                    hash: vec![],
+                }))
+                .await?
+                .into_inner();
+            let hash: Hash = b.hash.try_into().unwrap();
+            sqlx::query(
+                "INSERT INTO blocks(hash, height)
+            VALUES (?1, ?2)",
+            )
+            .bind(hash.as_slice())
+            .bind(height)
+            .execute(&mut *connection)
+            .await?;
+        }
+        Ok(())
+    }
 
-        let mut s = connection.prepare("SELECT id_note, nf FROM received_notes WHERE spent IS NULL")?;
-        let nfs = s.query_map([], |row| {
-            let id_note: u32 = row.get(0)?;
-            let nf: Vec<u8> = row.get(1)?;
-            let mut nf_bytes = [0u8; 32];
-            nf_bytes.copy_from_slice(&nf);
-            Ok((id_note, nf_bytes))
-        })?;
-        let mut nf_map = HashMap::<[u8; 32], u32>::new();
-        for nf in nfs {
-            let (id_note, nf) = nf?;
-            nf_map.insert(nf, id_note);
+    pub async fn get_nfs(&self) -> Result<HashMap<[u8; 32], u64>> {
+        let mut connection = self.pool.acquire().await?;
+
+        let nfs = sqlx::query("SELECT nf, value FROM received_notes WHERE spent = 0")
+            .map(|row: SqliteRow| {
+                let nf: Vec<u8> = row.get(0);
+                let value: u64 = row.get(1);
+                let nf: Hash = nf.try_into().unwrap();
+                (nf, value)
+            })
+            .fetch_all(&mut *connection)
+            .await?;
+
+        let mut nf_map = HashMap::new();
+        for (nf, value) in nfs {
+            nf_map.insert(nf, value);
         }
         Ok(nf_map)
     }
 
-    fn next_diversifier(&self, connection: &Connection) -> anyhow::Result<(u64, String)> {
-        let diversifier: Option<u64> =
-            connection.query_row("SELECT MAX(diversifier_index) FROM addresses", [], |row| {
-                row.get(0)
-            })?;
-        let (next_index, pa) = if let Some(diversifier) = diversifier {
-            let mut di = [0u8; 11];
-            di[0..8].copy_from_slice(&diversifier.to_le_bytes());
-            let mut index = DiversifierIndex::from(di);
-            index
-                .increment()
-                .map_err(|_| anyhow::anyhow!("Out of diversified addresses"))?;
-            let pa = self
-                .fvk
-                .address(index)
-                .ok_or_else(|| anyhow::anyhow!("Could not derive new subaccount"))?;
-            (index, pa)
-        } else {
-            self.fvk
-                .default_address()
-        };
-        let mut di = [0u8; 8];
-        di.copy_from_slice(&next_index.as_bytes()[0..8]);
-        let next_index = u64::from_le_bytes(di);
-        Ok((
-            next_index,
-            encode_payment_address(self.network.hrp_sapling_payment_address(), &pa),
-        ))
+    async fn next_diversifier(&self, connection: &mut SqliteConnection) -> Result<(u64, String)> {
+        let di = sqlx::query("SELECT MAX(diversifier_index) FROM addresses")
+            .map(|r: SqliteRow| r.get::<Option<u64>, _>(0))
+            .fetch_one(&mut *connection)
+            .await?
+            .map(|di| di + 1)
+            .unwrap_or_default();
+        let (ua, ndi) = self
+            .ufvk
+            .find_address(di.into(), UnifiedAddressRequest::AllAvailableKeys)?;
+        let ua = ua.encode(&self.network);
+        let ndi: u64 = ndi.try_into().unwrap();
+        Ok((ndi, ua))
     }
 
-    pub fn create(&self) -> anyhow::Result<bool> {
-        let connection = self.grab_lock();
+    pub async fn create(&self) -> Result<bool> {
+        let mut connection = self.pool.acquire().await?;
 
-        connection.execute(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS blocks (
             height INTEGER PRIMARY KEY,
             hash BLOB NOT NULL)",
-            [],
-        )?;
+        )
+        .execute(&mut *connection)
+        .await?;
 
-        connection.execute(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS addresses (
             id_address INTEGER PRIMARY KEY,
             label TEXT NOT NULL,
@@ -310,19 +400,31 @@ impl Db {
             sub_account INTEGER NOT NULL,
             address TEXT NOT NULL,
             diversifier_index INTEGER NOT NULL)",
-            [],
-        )?;
+        )
+        .execute(&mut *connection)
+        .await?;
 
-        connection.execute(
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS receivers (
+            id_receiver INTEGER PRIMARY KEY,
+            pool INTEGER NOT NULL,
+            id_address INTEGER NOT NULL,
+            receiver_address TEXT NOT NULL)",
+        )
+        .execute(&mut *connection)
+        .await?;
+
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS transactions (
             id_tx INTEGER PRIMARY KEY,
             txid BLOB NOT NULL UNIQUE,
             height INTEGER NOT NULL,
             value INTEGER NOT NULL)",
-            [],
-        )?;
+        )
+        .execute(&mut *connection)
+        .await?;
 
-        connection.execute(
+        sqlx::query(
             "CREATE TABLE IF NOT EXISTS received_notes (
             id_note INTEGER PRIMARY KEY,
             address TEXT NOT NULL,
@@ -335,15 +437,206 @@ impl Db {
             value INTEGER NOT NULL,
             rcm BLOB NOT NULL,
             nf BLOB NOT NULL UNIQUE,
+            rho BLOB,
             memo TEXT,
             spent INTEGER,
             CONSTRAINT tx_output UNIQUE (position))",
-            [],
-        )?;
+        )
+        .execute(&mut *connection)
+        .await?;
 
-        let r: Option<u32> = connection
-            .query_row("SELECT 1 FROM addresses", [], |r| r.get(0)).optional()?;
+        if sqlx::query("SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'rho'")
+            .fetch_optional(&mut *connection)
+            .await?
+            .is_none()
+        {
+            panic!("Old database schema. This version is not compatible with it.");
+        }
+
+        let r = sqlx::query("SELECT 1 FROM addresses")
+            .map(|r: SqliteRow| r.get::<u32, _>(0))
+            .fetch_optional(&mut *connection)
+            .await?;
 
         Ok(r.is_some())
+    }
+
+    pub async fn store_events(&self, events: &[ScanEvent]) -> Result<()> {
+        let mut connection = self.pool.acquire().await?;
+        let mut db_transaction = connection.begin().await?;
+        let db_tx = db_transaction.acquire().await?;
+
+        for event in events {
+            match event {
+                ScanEvent::Received(received_note) => {
+                    let id_tx = self
+                        .create_tx_if_not_exists(
+                            received_note.height,
+                            received_note.txid.as_slice(),
+                            db_tx,
+                        )
+                        .await?;
+                    let (account, sub_account) = match sqlx::query(
+                        "SELECT a.account, a.sub_account FROM addresses a
+                        JOIN receivers r ON a.id_address = r.id_address
+                        WHERE r.receiver_address = ?1",
+                    )
+                    .bind(&received_note.address)
+                    .map(|r: SqliteRow| {
+                        let account: u32 = r.get(0);
+                        let sub_account: u32 = r.get(1);
+                        (account, sub_account)
+                    })
+                    .fetch_optional(&mut *db_tx)
+                    .await?
+                    {
+                        Some(x) => x,
+                        None => {
+                            let account = sqlx::query("SELECT MAX(account) FROM addresses")
+                                .map(|r: SqliteRow| {
+                                    let account: Option<u32> = r.get(0);
+                                    account.unwrap_or_default()
+                                })
+                                .fetch_one(&mut *db_tx)
+                                .await?;
+                            let sub_account = sqlx::query(
+                                "SELECT MAX(sub_account) FROM addresses WHERE account = ?1",
+                            )
+                            .bind(account)
+                            .map(|r: SqliteRow| {
+                                let sub_account: Option<u32> = r.get(0);
+                                sub_account.map(|x| x + 1).unwrap_or_default()
+                            })
+                            .fetch_optional(&mut *db_tx)
+                            .await?
+                            .unwrap_or_default();
+
+                            let r = sqlx::query(
+                                "INSERT INTO addresses
+                            (label, account, sub_account, address, diversifier_index)
+                            VALUES ('', ?1, ?2, ?3, ?4)",
+                            )
+                            .bind(account)
+                            .bind(sub_account)
+                            .bind(&received_note.address)
+                            .bind(received_note.diversifier_index.unwrap_or_default() as u32)
+                            .execute(&mut *db_tx)
+                            .await?;
+                            let id_address = r.last_insert_rowid() as u32;
+
+                            sqlx::query(
+                                "INSERT INTO receivers(pool, id_address, receiver_address)
+                                VALUES (?1, ?2, ?3)",
+                            )
+                            .bind(received_note.pool)
+                            .bind(id_address)
+                            .bind(&received_note.address)
+                            .execute(&mut *db_tx)
+                            .await?;
+
+                            (account, sub_account)
+                        }
+                    };
+
+                    sqlx::query(
+                        "INSERT INTO received_notes
+                        (address, account, sub_account, id_tx, position, height,
+                        diversifier, value, rcm, nf, rho, memo, spent)
+                        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'',0)",
+                    )
+                    .bind(&received_note.address)
+                    .bind(account)
+                    .bind(sub_account)
+                    .bind(id_tx)
+                    .bind(received_note.position)
+                    .bind(received_note.height)
+                    .bind(received_note.diversifier.as_slice())
+                    .bind(received_note.value as i64)
+                    .bind(received_note.rcm.as_slice())
+                    .bind(received_note.nf.as_slice())
+                    .bind(received_note.rho.map(|r| r.to_vec()))
+                    .execute(&mut *db_tx)
+                    .await?;
+                    sqlx::query("UPDATE transactions SET value = value + ?2 WHERE txid = ?1")
+                        .bind(received_note.txid.as_slice())
+                        .bind(received_note.value as i64)
+                        .execute(&mut *db_tx)
+                        .await?;
+                }
+                ScanEvent::Spent(spent_note) => {
+                    self.create_tx_if_not_exists(
+                        spent_note.height,
+                        spent_note.txid.as_slice(),
+                        db_tx,
+                    )
+                    .await?;
+                    sqlx::query("UPDATE received_notes SET spent = TRUE WHERE nf = ?1")
+                        .bind(spent_note.nf.as_slice())
+                        .execute(&mut *db_tx)
+                        .await?;
+                    sqlx::query("UPDATE transactions SET value = value - ?2 WHERE txid = ?1")
+                        .bind(spent_note.txid.as_slice())
+                        .bind(spent_note.value as i64)
+                        .execute(&mut *db_tx)
+                        .await?;
+                }
+                ScanEvent::Memo(memo_note) => {
+                    sqlx::query("UPDATE received_notes SET memo = ?2 WHERE nf = ?1")
+                        .bind(memo_note.nf.as_slice())
+                        .bind(&memo_note.memo)
+                        .execute(&mut *db_tx)
+                        .await?;
+                }
+                ScanEvent::Block(height, hash) => {
+                    sqlx::query(
+                        "INSERT INTO blocks(height, hash)
+                        VALUES (?1, ?2)",
+                    )
+                    .bind(*height)
+                    .bind(hash.as_slice())
+                    .execute(&mut *db_tx)
+                    .await?;
+                }
+            }
+        }
+        db_transaction.commit().await?;
+
+        Ok(())
+    }
+
+    pub async fn create_tx_if_not_exists(
+        &self,
+        height: u32,
+        txid: &[u8],
+        db_tx: &mut SqliteConnection,
+    ) -> Result<u32> {
+        // let txid = &received_note.txid;
+        let id_tx = match sqlx::query("SELECT id_tx FROM transactions WHERE txid = ?1")
+            .bind(txid)
+            .map(|r: SqliteRow| r.get::<u32, _>(0))
+            .fetch_optional(&mut *db_tx)
+            .await?
+        {
+            Some(id_tx) => id_tx,
+            None => {
+                let r =
+                    sqlx::query("INSERT INTO transactions(txid, height, value) VALUES (?1, ?2, 0)")
+                        .bind(txid)
+                        .bind(height)
+                        .execute(db_tx)
+                        .await?;
+                let id_tx = r.last_insert_rowid();
+
+                notify_tx(txid, &self.notify_tx_url).await?;
+
+                id_tx as u32
+            }
+        };
+
+        Ok(id_tx)
+    }
+
+    pub fn ufvk(&self) -> &UnifiedFullViewingKey {
+        &self.ufvk
     }
 }
