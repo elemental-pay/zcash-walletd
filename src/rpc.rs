@@ -14,11 +14,30 @@ use crate::lwd_rpc::compact_tx_streamer_client::CompactTxStreamerClient;
 use tonic::Request;
 use crate::lwd_rpc::*;
 use crate::scan::{ScannerOutput, ScanError};
+use crate::WalletMap;
+use zcash_client_backend::encoding::decode_extended_full_viewing_key;
+use zcash_protocol::consensus::NetworkConstants;
+use std::fs;
+use std::path::Path;
+use std::sync::Arc;
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateAccountRequest {
+    wallet_id: String,
     label: Option<String>,
 }
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateWalletRequest {
+    wallet_id: String,
+    vk: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CreateWalletResponse {
+    wallet_id: String,
+}
+
 
 #[derive(Serialize, Deserialize)]
 pub struct CreateAccountResponse {
@@ -26,13 +45,62 @@ pub struct CreateAccountResponse {
     address: String,
 }
 
+#[post("/create_wallet", data = "<request>")]
+pub fn create_wallet(
+    request: Json<CreateWalletRequest>, state: &State<WalletMap>, config: &State<WalletConfig>
+) -> Result<Json<CreateWalletResponse>, Debug<anyhow::Error>>  {
+    let request = request.into_inner();
+    let wallet_id = request.wallet_id;
+    if {
+        let map = state.read().unwrap();
+        map.get(&wallet_id).is_some()
+    } {
+        return Err(Debug(anyhow::anyhow!("Wallet `{}` already exists", wallet_id)));
+    }
+    let vk = request.vk;
+    // let cfg_path = format!("./{}/config.json", wallet_id);
+    let dir_path = format!("./{}", wallet_id);
+    let db_path = format!("{}/wallet.db", dir_path);
+    let network = config.network();
+
+    fs::create_dir_all(&dir_path).expect("Invalid db path");
+
+    let fvk = decode_extended_full_viewing_key(
+        network.hrp_sapling_extended_full_viewing_key(),
+        &vk,
+    ).expect("Invalid viewing key");
+
+    let db = Arc::new(Db::new(network, &db_path, &fvk));
+
+    let db_exists = db.create().unwrap();
+    if !db_exists {
+        db.new_account("")?;
+    }
+
+    let mut map = state.write().unwrap();
+    map.insert(wallet_id.to_string(), db);
+
+    let rep = CreateWalletResponse {
+        wallet_id: wallet_id,
+    };
+    Ok(Json(rep))
+}
+
 #[post("/create_account", data = "<request>")]
 pub fn create_account(
     request: Json<CreateAccountRequest>,
-    db: &State<Db>,
+    state: &State<WalletMap>
+    // db: &State<Db>,
 ) -> Result<Json<CreateAccountResponse>, Debug<anyhow::Error>> {
     let request = request.into_inner();
     let name = request.label.unwrap_or("".to_string());
+    let wallet_id = request.wallet_id;
+    let db = {
+        let map = state.read().unwrap();
+        map.get(&wallet_id)
+            .cloned()
+            .ok_or_else(|| Debug(anyhow::anyhow!("Wallet `{}` does not exist", wallet_id)))?
+    };
 
     let account = db.new_account(&name)?;
     let rep = CreateAccountResponse {

@@ -42,6 +42,9 @@ use rocket::fairing::AdHoc;
 use serde::{Deserialize, Serialize};
 use figment::{Figment, providers::{Json, Format, Env}};
 use std::path::Path;
+use std::sync::{Arc, RwLock};
+// use rand::{distributions::Alphanumeric, Rng};
+use std::collections::HashMap;
 
 pub struct FVK(pub Mutex<ExtendedFullViewingKey>);
 
@@ -57,6 +60,8 @@ pub struct WalletConfig {
     poll_interval: u16,
     regtest: bool,
 }
+
+type WalletMap = Arc<RwLock<HashMap<String, Arc<Db>>>>;
 
 impl WalletConfig {
     pub fn network(&self) -> Network {
@@ -76,6 +81,43 @@ struct DataConfig {
     birth_height: Option<u32>
 }
 
+// fn get_or_init_wallet(
+//     wallets: &WalletMap,
+//     wallet_id: &str,
+//     network: &Network,
+// ) -> anyhow::Result<Db> {
+//     let mut map = wallets.lock().unwrap();
+
+//     if let Some(db) = map.get(wallet_id) {
+//         return Ok(db.clone());
+//     }
+
+//     // Load per-wallet config
+//     let cfg_path = format!("./{}/config.json", wallet_id);
+//     let wallet_cfg: WalletConfig = Figment::new()
+//         .merge(Json::file(&cfg_path))
+//         .extract()?;
+
+//     let vk = wallet_cfg.vk
+//         .or_else(|| dotenv::var("VK").ok()) // fallback
+//         .expect("No VK found for wallet");
+
+//     let fvk = decode_extended_full_viewing_key(
+//         network.hrp_sapling_extended_full_viewing_key(),
+//         &vk,
+//     )?;
+
+//     let db_path = format!("./{}/wallet.db", wallet_id);
+//     let db = Db::new(network.clone(), &db_path, &fvk);
+//     let db_exists = db.create().unwrap();
+//     if !db_exists {
+//         db.new_account("")?;
+//     }
+
+//     map.insert(wallet_id.to_string(), db.clone());
+//     Ok(db)
+// }
+
 #[rocket::main]
 async fn main() -> anyhow::Result<()> {
     dotenv::dotenv().ok();
@@ -84,6 +126,14 @@ async fn main() -> anyhow::Result<()> {
     let data_config: DataConfig = Figment::new()
         .merge(Json::file(Path::new("/data/config.json")))
         .extract()?;
+    let wallets: WalletMap = Arc::new(RwLock::new(HashMap::new()));
+    
+
+    // let wallet_name: String = rand::thread_rng()
+    //     .sample_iter(&Alphanumeric)
+    //     .take(7)
+    //     .map(char::from)
+    //     .collect();
 
     let mut figment = rocket::Config::figment()
         .merge(Json::file("/data/config.json"))
@@ -121,14 +171,16 @@ async fn main() -> anyhow::Result<()> {
         }
     else { None };
 
-    monitor_task(birth_height, config.port, config.poll_interval).await;
+    // monitor_task(birth_height, config.port, config.poll_interval).await;
 
     rocket::custom(figment)
+        .manage(wallets)
         .manage(db)
         .manage(fvk)
         .mount(
             "/",
             routes![
+                create_wallet,
                 create_account,
                 create_address,
                 get_accounts,
