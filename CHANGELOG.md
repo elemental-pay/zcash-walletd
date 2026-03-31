@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.1.8](https://github.com/hhanh00/zcash-walletd/compare/zcash-walletd-v1.1.7...zcash-walletd-v1.1.8) (2026-01-15)
+
+
+### Bug Fixes
+
+* rollback back 100 blocks on a reorg ([#58](https://github.com/hhanh00/zcash-walletd/issues/58)) ([6b9489f](https://github.com/hhanh00/zcash-walletd/commit/6b9489f33033d0a76e70a508cef7d7f64fc10710))
+
+## [1.1.7](https://github.com/hhanh00/zcash-walletd/compare/zcash-walletd-v1.1.6...zcash-walletd-v1.1.7) (2026-01-15)
+
+
+### Bug Fixes
+
+* cleanup stale data at startup ([#56](https://github.com/hhanh00/zcash-walletd/issues/56)) ([3aad080](https://github.com/hhanh00/zcash-walletd/commit/3aad080806216c9effc2d86fcecaf584ec9045a0))
+
+## [1.1.6](https://github.com/hhanh00/zcash-walletd/compare/zcash-walletd-v1.1.5...zcash-walletd-v1.1.6) (2026-01-08)
+
+
+### Bug Fixes
+
+* notify_tx called before db_tx.commit ([#55](https://github.com/hhanh00/zcash-walletd/issues/55)) ([6c11fb1](https://github.com/hhanh00/zcash-walletd/commit/6c11fb19f7c999c4f421b91a44fdd2783fed669e))
+* return error for unknown txid ([#51](https://github.com/hhanh00/zcash-walletd/issues/51)) ([617136c](https://github.com/hhanh00/zcash-walletd/commit/617136c72f30c5a9b33dec72ff13826a2af4cda8))
+
+## [1.1.5](https://github.com/hhanh00/zcash-walletd/compare/zcash-walletd-v1.1.4...zcash-walletd-v1.1.5) (2025-11-28)
+
+
+### Bug Fixes
+
+* support for NU6.1 ([#49](https://github.com/hhanh00/zcash-walletd/issues/49)) ([59d9b83](https://github.com/hhanh00/zcash-walletd/commit/59d9b83dde8724ff58f6ca8d5eed220ed80ed06c))
+
+## [1.1.4](https://github.com/hhanh00/zcash-walletd/compare/zcash-walletd-v1.1.3...zcash-walletd-v1.1.4) (2025-10-28)
+
+
+### Bug Fixes
+
+* race condition possibility in account/address creation ([#46](https://github.com/hhanh00/zcash-walletd/issues/46)) ([dc84da2](https://github.com/hhanh00/zcash-walletd/commit/dc84da2b6299243469125c0075f712e9347ca08d))
+
 ## [1.1.3](https://github.com/hhanh00/zcash-walletd/compare/zcash-walletd-v1.1.2...zcash-walletd-v1.1.3) (2025-08-29)
 
 
