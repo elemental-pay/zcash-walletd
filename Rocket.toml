@@ -3,6 +3,7 @@ db_path = "zec-wallet.db"
 confirmations = 6
 lwd_url = "https://zec.rocks"
 notify_tx_url = "http://btcpayserver:9000/zcashlikedaemoncallback/tx?cryptoCode=zec&hash="
+notify_block_url = "http://btcpayserver:9000/zcashlikedaemoncallback/block?cryptoCode=zec&hash="
 poll_interval = 60
 regtest = false
 orchard = true
