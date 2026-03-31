@@ -1,13 +1,15 @@
 use crate::account::{Account, AccountBalance, SubAccount};
 use crate::lwd_rpc::BlockId;
+use crate::lwd_rpc::compact_tx_streamer_client::CompactTxStreamerClient;
 use crate::network::Network;
-use crate::scan::ScanEvent;
+use crate::scan::{ScanError, ScanEvent};
 use crate::transaction::{SubAddress, Transfer};
-use crate::{notify_tx, Client, Hash};
+use crate::{notify_tx, notify_block, Client, Hash};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Acquire, Row, SqliteConnection, SqlitePool};
 use tonic::Request;
+use tonic::transport::Channel;
 use std::collections::HashMap;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::encoding::AddressCodec;
@@ -19,6 +21,7 @@ pub struct Db {
     pool: SqlitePool,
     ufvk: UnifiedFullViewingKey,
     notify_tx_url: String,
+    notify_block_url: String
 }
 
 impl Db {
@@ -27,6 +30,7 @@ impl Db {
         db_path: &str,
         ufvk: &UnifiedFullViewingKey,
         notify_tx_url: &str,
+        notify_block_url: &str,
     ) -> Result<Self> {
         let options = SqliteConnectOptions::new()
             .filename(db_path)
@@ -37,6 +41,7 @@ impl Db {
             pool,
             ufvk: ufvk.clone(),
             notify_tx_url: notify_tx_url.to_string(),
+            notify_block_url: notify_block_url.to_string(),
         })
     }
 
@@ -205,12 +210,13 @@ impl Db {
         Ok(hash)
     }
 
-    fn row_to_transfer(
+    async fn row_to_transfer(
         row: SqliteRow,
         latest_height: u32,
         account_index: u32,
         confirmations: u32,
-    ) -> Transfer {
+        client: &mut Client,
+    ) -> Result<Transfer, ScanError> {
         let address: String = row.get(0);
         let value: u64 = row.get(1);
         let sub_account: u32 = row.get(2);
@@ -218,7 +224,22 @@ impl Db {
         txid.reverse();
         let memo: String = row.get(4);
         let height: u32 = row.get(5);
-        Transfer {
+
+        let timestamp = if height > 0 {
+            let response = client
+                .get_block(BlockId {
+                    height: height as u64,
+                    hash: vec![], // just use height
+                })
+                .await
+                .map_err(|e| ScanError::Other(anyhow::anyhow!(e)))?;
+
+            response.into_inner().time as u64
+        } else {
+            0 // mempool/unconfirmed
+        };
+
+        Ok(Transfer {
             address,
             amount: value,
             confirmations: latest_height - height + 1,
@@ -231,11 +252,11 @@ impl Db {
                 minor: sub_account,
             },
             suggested_confirmations_threshold: confirmations,
-            timestamp: 0, // TODO: Check if needed
+            timestamp,
             txid: hex::encode(txid),
             r#type: "in".to_string(),
             unlock_time: 0,
-        }
+        })
     }
 
     pub async fn get_transfers(
@@ -244,18 +265,29 @@ impl Db {
         account_index: u32,
         sub_accounts: &[u32],
         confirmations: u32,
+        client: &mut CompactTxStreamerClient<Channel>
     ) -> Result<Vec<Transfer>> {
         let mut connection = self.pool.acquire().await?;
 
-        let transfers = sqlx::query(
-            "SELECT address, n.value, sub_account, txid, memo, n.height \
-            FROM received_notes n JOIN transactions t ON n.id_tx = t.id_tx WHERE \
-            account = ?1 ORDER BY n.height",
+        let rows = sqlx::query(
+            "SELECT a.address, n.value, n.sub_account, txid, memo, n.height \
+            FROM received_notes n
+            JOIN transactions t ON n.id_tx = t.id_tx
+            JOIN receivers r ON n.address = r.receiver_address
+			JOIN addresses a ON a.id_address = r.id_address
+            WHERE \
+            n.account = ?1 ORDER BY n.height",
         )
         .bind(account_index)
-        .map(|row| Self::row_to_transfer(row, latest_height, account_index, confirmations))
         .fetch_all(&mut *connection)
         .await?;
+
+        let mut transfers = Vec::new();
+        for row in rows {
+            let transfer = Self::row_to_transfer(row, latest_height, account_index, confirmations, client)
+                .await?;
+            transfers.push(transfer);
+        }
 
         let transfers = transfers
             .into_iter()
@@ -270,12 +302,13 @@ impl Db {
         txid: &str,
         account_index: u32,
         confirmations: u32,
+        client: &mut Client,
     ) -> Result<Vec<Transfer>> {
         let mut connection = self.pool.acquire().await?;
 
         let mut txid = hex::decode(txid)?;
         txid.reverse();
-        let transfers = sqlx::query(
+        let rows = sqlx::query(
             "SELECT a.address, n.value, n.sub_account, txid, memo, n.height
             FROM received_notes n
 			JOIN transactions t ON n.id_tx = t.id_tx
@@ -285,9 +318,15 @@ impl Db {
 			ORDER BY n.height",
         )
         .bind(txid)
-        .map(|row| Self::row_to_transfer(row, latest_height, account_index, confirmations))
         .fetch_all(&mut *connection)
         .await?;
+
+        let mut transfers = Vec::new();
+        for row in rows {
+            let transfer = Self::row_to_transfer(row, latest_height, account_index, confirmations, client)
+                .await?;
+            transfers.push(transfer);
+        }
         Ok(transfers)
     }
 
@@ -342,6 +381,8 @@ impl Db {
             .bind(height)
             .execute(&mut *connection)
             .await?;
+
+            notify_block(hash, &self.notify_block_url).await?;
         }
         Ok(())
     }
@@ -596,6 +637,8 @@ impl Db {
                     .bind(hash.as_slice())
                     .execute(&mut *db_tx)
                     .await?;
+
+                    notify_block(*hash, &self.notify_block_url).await?;
                 }
             }
         }

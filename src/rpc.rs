@@ -128,6 +128,7 @@ pub async fn get_transaction(
             &request.txid,
             request.account_index,
             config.confirmations,
+            &mut client,
         )
         .await?;
     let rep = GetTransactionByIdResponse {
@@ -168,6 +169,7 @@ pub async fn get_transfers(
             request.account_index,
             &request.subaddr_indices,
             config.confirmations,
+            &mut client,
         )
         .await?;
     let rep = GetTransfersResponse { r#in: transfers };
@@ -334,6 +336,27 @@ pub async fn notify_tx(txid: &[u8], notify_tx_url: &str) -> Result<()> {
         .await;
     if let Err(e) = res {
         log::warn!("Failed to notify new tx: {e}",);
+    }
+
+    Ok(())
+}
+
+pub async fn notify_block(hash: [u8; 32], notify_block_url: &str) -> Result<()> {
+    let mut hash = hash.to_vec();
+    hash.reverse();
+    let hash = hex::encode(&hash);
+    info!("Notify block {}", &hash);
+
+    let url = notify_block_url.to_string() + &hash;
+    // TODO: Remove self signed certificate accept
+    let res = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .build()?
+        .get(url)
+        .send()
+        .await;
+    if let Err(e) = res {
+        log::warn!("Failed to notify new block: {e}",);
     }
 
     Ok(())

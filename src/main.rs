@@ -59,6 +59,7 @@ pub struct WalletConfig {
     confirmations: u32,
     lwd_url: String,
     notify_tx_url: String,
+    notify_block_url: String,
     poll_interval: u16,
     regtest: bool,
     orchard: bool,
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
     let birth_height = config.birth_height;
     let ufvk = UnifiedFullViewingKey::decode(&network, ufvk)
         .map_err(|_| anyhow!("Invalid Unified Viewing Key"))?;
-    let db = Db::new(network, &config.db_path, &ufvk, &config.notify_tx_url).await?;
+    let db = Db::new(network, &config.db_path, &ufvk, &config.notify_tx_url, &config.notify_block_url).await?;
     let db_exists = db.create().await?;
     if !db_exists {
         db.new_account("").await?;
