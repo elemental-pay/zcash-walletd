@@ -7,18 +7,20 @@ use crate::{notify_tx, Client, Hash};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteRow};
 use sqlx::{Acquire, Row, SqliteConnection, SqlitePool};
-use tonic::Request;
 use std::collections::HashMap;
+use tokio::sync::Mutex;
+use tonic::Request;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::encoding::AddressCodec;
 use zcash_keys::keys::{UnifiedAddressRequest, UnifiedFullViewingKey};
-use zcash_primitives::consensus::{NetworkUpgrade, Parameters};
+use zcash_protocol::consensus::{NetworkUpgrade, Parameters};
 
 pub struct Db {
     network: Network,
     pool: SqlitePool,
     ufvk: UnifiedFullViewingKey,
     notify_tx_url: String,
+    address_creation_lock: Mutex<()>,
 }
 
 impl Db {
@@ -37,10 +39,20 @@ impl Db {
             pool,
             ufvk: ufvk.clone(),
             notify_tx_url: notify_tx_url.to_string(),
+            address_creation_lock: Mutex::new(()),
         })
     }
 
+    async fn cleanup_stale_data(connection: &mut SqliteConnection) -> Result<()> {
+        sqlx::query("DELETE FROM received_notes WHERE height >=
+            (SELECT MAX(height) FROM blocks)")
+        .execute(connection)
+        .await?;
+        Ok(())
+    }
+
     pub async fn new_account(&self, name: &str) -> Result<Account> {
+        let _guard = self.address_creation_lock.lock().await;
         let mut connection = self.pool.acquire().await?;
         let (id_account,): (Option<u32>,) = sqlx::query_as("SELECT MAX(account) FROM addresses")
             .fetch_one(&mut *connection)
@@ -65,6 +77,7 @@ impl Db {
     }
 
     pub async fn new_sub_account(&self, id_account: u32, name: &str) -> Result<SubAccount> {
+        let _guard = self.address_creation_lock.lock().await;
         let mut connection = self.pool.acquire().await?;
         let (id_sub_account,): (u32,) =
             sqlx::query_as("SELECT MAX(sub_account) FROM addresses WHERE account = ?1")
@@ -314,11 +327,7 @@ impl Db {
         Ok(())
     }
 
-    pub async fn fetch_block_hash(
-        &self,
-        client: &mut Client,
-        height: u32,
-    ) -> Result<()> {
+    pub async fn fetch_block_hash(&self, client: &mut Client, height: u32) -> Result<()> {
         let mut connection = self.pool.acquire().await?;
         if sqlx::query("SELECT 1 FROM blocks WHERE height = ?1")
             .bind(height)
@@ -445,6 +454,8 @@ impl Db {
         .execute(&mut *connection)
         .await?;
 
+        Self::cleanup_stale_data(&mut connection).await?;
+
         if sqlx::query("SELECT 1 FROM pragma_table_info('received_notes') WHERE name = 'rho'")
             .fetch_optional(&mut *connection)
             .await?
@@ -465,17 +476,22 @@ impl Db {
         let mut connection = self.pool.acquire().await?;
         let mut db_transaction = connection.begin().await?;
         let db_tx = db_transaction.acquire().await?;
+        let mut notify_txids = vec![];
 
         for event in events {
             match event {
                 ScanEvent::Received(received_note) => {
-                    let id_tx = self
+                    let (id_tx, is_new) = self
                         .create_tx_if_not_exists(
                             received_note.height,
                             received_note.txid.as_slice(),
                             db_tx,
                         )
                         .await?;
+                    if is_new {
+                        notify_txids.push(received_note.txid);
+                    }
+
                     let (account, sub_account) = match sqlx::query(
                         "SELECT a.account, a.sub_account FROM addresses a
                         JOIN receivers r ON a.id_address = r.id_address
@@ -564,12 +580,15 @@ impl Db {
                         .await?;
                 }
                 ScanEvent::Spent(spent_note) => {
-                    self.create_tx_if_not_exists(
+                    let (_, is_new) = self.create_tx_if_not_exists(
                         spent_note.height,
                         spent_note.txid.as_slice(),
                         db_tx,
                     )
                     .await?;
+                    if is_new {
+                        notify_txids.push(spent_note.txid);
+                    }
                     sqlx::query("UPDATE received_notes SET spent = TRUE WHERE nf = ?1")
                         .bind(spent_note.nf.as_slice())
                         .execute(&mut *db_tx)
@@ -601,6 +620,12 @@ impl Db {
         }
         db_transaction.commit().await?;
 
+        // Once committed, we can notify our listeners of the new received
+        // txs
+        for txid in notify_txids {
+            notify_tx(&txid, &self.notify_tx_url).await?;
+        }
+
         Ok(())
     }
 
@@ -609,15 +634,15 @@ impl Db {
         height: u32,
         txid: &[u8],
         db_tx: &mut SqliteConnection,
-    ) -> Result<u32> {
+    ) -> Result<(u32, bool)> {
         // let txid = &received_note.txid;
-        let id_tx = match sqlx::query("SELECT id_tx FROM transactions WHERE txid = ?1")
+        let result = match sqlx::query("SELECT id_tx FROM transactions WHERE txid = ?1")
             .bind(txid)
             .map(|r: SqliteRow| r.get::<u32, _>(0))
             .fetch_optional(&mut *db_tx)
             .await?
         {
-            Some(id_tx) => id_tx,
+            Some(id_tx) => (id_tx, false),
             None => {
                 let r =
                     sqlx::query("INSERT INTO transactions(txid, height, value) VALUES (?1, ?2, 0)")
@@ -627,13 +652,11 @@ impl Db {
                         .await?;
                 let id_tx = r.last_insert_rowid();
 
-                notify_tx(txid, &self.notify_tx_url).await?;
-
-                id_tx as u32
+                (id_tx as u32, true)
             }
         };
 
-        Ok(id_tx)
+        Ok(result)
     }
 
     pub fn ufvk(&self) -> &UnifiedFullViewingKey {

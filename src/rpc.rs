@@ -130,6 +130,9 @@ pub async fn get_transaction(
             config.confirmations,
         )
         .await?;
+    if transfers.is_empty() {
+        return Err(anyhow::anyhow!("Unknown txid {}", &request.txid).into());
+    }
     let rep = GetTransactionByIdResponse {
         transfer: transfers[0].clone(),
         transfers,
@@ -265,13 +268,13 @@ pub async fn request_scan(
     let nfs = db.get_nfs().await?;
     let mut sap_dec = ufvk.sapling().map(|fvk| {
         let nk = fvk.fvk().vk.nk;
-        let ivk = fvk.to_ivk(zcash_primitives::zip32::Scope::External);
+        let ivk = fvk.to_ivk(zip32::Scope::External);
         let pivk = sapling_crypto::keys::PreparedIncomingViewingKey::new(&ivk);
         // TODO: Load nfs
         Decoder::<Sapling>::new(nk, fvk.clone(), pivk, &nfs)
     });
     let mut orc_dec = ufvk.orchard().map(|fvk| {
-        let ivk = fvk.to_ivk(zcash_primitives::zip32::Scope::External);
+        let ivk = fvk.to_ivk(zip32::Scope::External);
         let pivk = orchard::keys::PreparedIncomingViewingKey::new(&ivk);
         // TODO: Load nfs
         Decoder::<Orchard>::new(fvk.clone(), ivk, pivk, &nfs)
@@ -304,7 +307,7 @@ pub async fn request_scan(
             match error {
                 ScanError::Reorganization => {
                     let synced_height = db.get_synced_height().await?;
-                    db.truncate_height(synced_height - config.confirmations)
+                    db.truncate_height(synced_height - SAFE_REORG_DISTANCE)
                         .await
                 }
                 ScanError::Other(error) => Err(error),
@@ -315,6 +318,18 @@ pub async fn request_scan(
             db.store_events(&events).await?;
         }
     }
+    Ok(())
+}
+
+pub const SAFE_REORG_DISTANCE: u32 = 100u32;
+
+#[post("/reorg")]
+pub async fn reorg(
+    db: &State<Db>,
+) -> Result<(), Debug<anyhow::Error>> {
+    let synced_height = db.get_synced_height().await?;
+    db.truncate_height(synced_height - SAFE_REORG_DISTANCE)
+        .await?;
     Ok(())
 }
 
